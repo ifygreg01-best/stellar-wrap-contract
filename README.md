@@ -644,6 +644,7 @@ storage layout must ship as a numbered migration:
 
 - [Canonical signed payload encoding](docs/signing-payload.md) — exact field order, XDR encoding rules, and test vectors required by backend signing services (issue #213)
 - [Admin rotation procedure](docs/admin-rotation.md) — safe procedure for rotating the admin address and signing pubkey, including verification, event monitoring, and rollback plan
+- [Fee sponsorship](docs/fee-sponsorship.md) — fee-bump flow for sponsors to pay mint fees and storage rent on behalf of users (issue #1045)
 
 ## Development
 
