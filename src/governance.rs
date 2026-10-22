@@ -1,10 +1,18 @@
 use soroban_sdk::{panic_with_error, symbol_short, Address, Env};
 
-use crate::admin::read_admin;
-use crate::{AdminProposal, ContractError, DataKey, ProposalStatus};
+use crate::{
+    admin::read_admin, storage_types::TimelockAction, AdminProposal, ContractError, DataKey,
+    ProposalStatus,
+};
+
+/// Minimum duration for an admin proposal (1 hour).
+pub const MIN_PROPOSAL_DURATION: u64 = 60 * 60;
+/// Maximum duration for an admin proposal (30 days).
+pub const MAX_PROPOSAL_DURATION: u64 = 30 * 24 * 60 * 60;
 
 /// Create a new proposal to update the contract admin.
 /// Returns the generated proposal ID.
+#[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
 pub(crate) fn create_admin_proposal(
     e: Env,
     proposer: Address,
@@ -13,10 +21,10 @@ pub(crate) fn create_admin_proposal(
 ) -> u64 {
     proposer.require_auth();
 
-    if duration_seconds == 0 {
+    if duration_seconds < MIN_PROPOSAL_DURATION || duration_seconds > MAX_PROPOSAL_DURATION {
         panic_with_error!(e, ContractError::InvalidProposalDuration);
     }
-
+    
     let count: u64 = e
         .storage()
         .instance()
@@ -25,12 +33,17 @@ pub(crate) fn create_admin_proposal(
     let proposal_id = count + 1;
 
     let start_time = e.ledger().timestamp();
-    let end_time = start_time + duration_seconds;
+    let end_time = start_time
+        .checked_add(duration_seconds)
+        .unwrap_or_else(|| panic_with_error!(e, ContractError::InvalidProposalDuration));
+
+    let admin_at_creation = read_admin(&e);
 
     let proposal = AdminProposal {
         id: proposal_id,
         proposer: proposer.clone(),
         proposed_admin: proposed_admin.clone(),
+        admin_at_creation,
         votes_for: 0,
         votes_against: 0,
         start_time,
@@ -51,9 +64,11 @@ pub(crate) fn create_admin_proposal(
     );
 
     proposal_id
+
 }
 
 /// Cast a vote on an active governance proposal.
+#[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
 pub(crate) fn vote_admin_proposal(e: Env, voter: Address, proposal_id: u64, support: bool) {
     voter.require_auth();
 
@@ -96,6 +111,7 @@ pub(crate) fn vote_admin_proposal(e: Env, voter: Address, proposal_id: u64, supp
 }
 
 /// Execute a proposal once voting has ended. If votes_for > votes_against, the admin is updated.
+#[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
 pub(crate) fn execute_admin_proposal(e: Env, proposal_id: u64) {
     let mut proposal: AdminProposal = e
         .storage()
@@ -112,12 +128,27 @@ pub(crate) fn execute_admin_proposal(e: Env, proposal_id: u64) {
         panic_with_error!(e, ContractError::ProposalVotingPeriodNotEnded);
     }
 
+    // Issue #864: reject execution if the admin has changed since this proposal
+    // was created. Any admin drift — via update_admin, a timelocked SetAdmin,
+    // or a prior proposal execution — invalidates the proposal.
+    let current_admin = read_admin(&e);
+    if current_admin != proposal.admin_at_creation {
+        panic_with_error!(e, ContractError::StaleProposal);
+    }
+
     if proposal.votes_for > proposal.votes_against {
         proposal.status = ProposalStatus::Executed;
-        e.storage()
-            .instance()
-            .set(&DataKey::Admin, &proposal.proposed_admin);
-        e.storage().instance().remove(&DataKey::PendingAdmin);
+        if crate::timelock::is_enabled(&e) {
+            crate::timelock::schedule(
+                e.clone(),
+                TimelockAction::SetAdmin(proposal.proposed_admin.clone()),
+            );
+        } else {
+            e.storage()
+                .instance()
+                .set(&DataKey::Admin, &proposal.proposed_admin);
+            e.storage().instance().remove(&DataKey::PendingAdmin);
+        }
 
         e.events().publish(
             (symbol_short!("gov"), symbol_short!("executed")),
@@ -131,10 +162,8 @@ pub(crate) fn execute_admin_proposal(e: Env, proposal_id: u64) {
 
         e.events().publish(
             (symbol_short!("gov"), symbol_short!("defeated")),
-            (proposal_id,),
+            proposal_id,
         );
-
-        panic_with_error!(e, ContractError::ProposalDefeated);
     }
 
     e.storage()
@@ -143,6 +172,7 @@ pub(crate) fn execute_admin_proposal(e: Env, proposal_id: u64) {
 }
 
 /// Cancel a governance proposal. Can be called by the proposer or current admin before execution.
+#[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
 pub(crate) fn cancel_admin_proposal(e: Env, caller: Address, proposal_id: u64) {
     caller.require_auth();
 

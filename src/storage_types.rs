@@ -1,6 +1,7 @@
 #[cfg(any(test, feature = "testutils"))]
 extern crate std;
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, String, Symbol};
+
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, String, Symbol, Vec};
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -11,6 +12,7 @@ pub enum WrapState {
     Archived = 4,
     Cancelled = 5,
     Expired = 6,
+    Bridged = 7,
 }
 
 #[contracttype]
@@ -35,9 +37,12 @@ impl WrapLifecycleFSM {
                 | (WrapState::Draft, WrapState::Cancelled)
                 | (WrapState::Draft, WrapState::Expired)
                 | (WrapState::Pending, WrapState::Active)
+                | (WrapState::Bridged, WrapState::Active)
                 | (WrapState::Pending, WrapState::Cancelled)
                 | (WrapState::Pending, WrapState::Expired)
                 | (WrapState::Active, WrapState::Pending)
+                | (WrapState::Active, WrapState::Bridged)
+                | (WrapState::Pending, WrapState::Bridged)
                 | (WrapState::Active, WrapState::Archived)
                 | (WrapState::Active, WrapState::Cancelled)
         )
@@ -52,17 +57,34 @@ impl WrapLifecycleFSM {
             false
         }
     }
+
+    pub(crate) fn restore_from_bridge(&mut self, now: u64) -> bool {
+        if self.state == WrapState::Bridged {
+            self.state = WrapState::Active;
+            self.updated_at = now;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WrapRecord {
-    pub timestamp: u64,
+    /// Timestamp associated with the wrap record.
+    pub created_at: u64,
+    /// 32-byte hash associated with the wrapped data.
     pub data_hash: BytesN<32>,
+    /// Symbol identifying the wrap's archetype.
     pub archetype: Symbol,
-    pub period: u64, // Standardized to u64 for better indexing/sorting
-    pub fsm: WrapLifecycleFSM,
+    /// Period identifier used with the user to address this record in persistent storage.
+    pub period: u64,
+    /// Current lifecycle state and its last update timestamp.
+    pub lifecycle: WrapLifecycleFSM,
+    /// Optional human-readable description attached by the admin.
     pub description: Option<String>,
+    /// Optional image URL attached by the admin.
     pub image_url: Option<String>,
 }
 
@@ -74,6 +96,7 @@ pub struct BatchWrapItem {
     pub archetype: Symbol,
     pub data_hash: BytesN<32>,
     pub payload_version: u32,
+    pub valid_until: u64,
     pub signature: BytesN<64>,
 }
 
@@ -120,6 +143,8 @@ pub enum TimelockAction {
     SetWhitelistRoot(BytesN<32>),
     /// Change the timelock delay itself (seconds).
     SetTimelockDelay(u64),
+    /// Configure the bridge relayer set and threshold for a given chain.
+    SetBridgeRelayers(u32, BridgeRelayerSet),
 }
 
 /// A scheduled timelock operation awaiting execution.
@@ -161,6 +186,13 @@ pub struct InboundBridgeRecord {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeRelayerSet {
+    pub relayers: Vec<BytesN<32>>,
+    pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferFeeConfig {
     /// Amount of `token` charged to the sender for each successful transfer.
     pub amount: i128,
@@ -194,14 +226,18 @@ pub enum DataKey {
     TransferGuard,
     /// Stores the highest storage migration version already applied.
     MigrationVersion,
-    /// Stores a list of periods a user has minted wraps for.
+    /// Stores the periods a user has minted, in insertion order. `get_wraps`
+    /// returns records in this order, not sorted by period.
     UserPeriods(Address),
-    /// Stores the total number of successful wrap mints across all users.
+    /// Total number of wraps ever minted across all users (lifetime counter).
+    /// This is intentionally NOT decremented on `revoke_wrap` or `burn_wrap`.
     TotalWrapCount,
     /// Stores the total number of wrap records revoked on-chain.
     TotalRevoked,
     /// Stores a user-controlled 32-byte alias hash for privacy-preserving profile display.
     AliasHash(Address),
+    /// Stores the 32-byte hash that owns a given alias.
+    AliasOwner(BytesN<32>),
     /// Stores the token display name, if overridden by an admin.
     /// Falls back to a hardcoded default when unset — see `queries::name`.
     Name,
@@ -220,7 +256,8 @@ pub enum DataKey {
     LastUpdated(Address),
     /// Temporary mint reentrancy / double-call guard (temporary tier).
     MintGuard(Address),
-
+    /// Period that has been minted for a specific user, to prevent double minting.
+    MintedPeriod(Address, u32),
     // New instance storage keys for accounting / fee system:
     /// Estimated persistent storage bytes used by this contract (instance-level)
     StorageBytes,
@@ -228,17 +265,21 @@ pub enum DataKey {
     FeeParams,
     /// Merkle root committing to the off-chain whitelist (instance-level).
     WhitelistRoot,
-
     /// Mandatory delay, in seconds, between scheduling and executing a
     /// privileged action once the timelock is enabled (instance-level).
     TimelockDelay,
     /// A scheduled privileged action, keyed by its deterministic operation id.
     TimelockOp(BytesN<32>),
-    /// Ids of every currently scheduled timelock operation (instance-level).
+    /// Ids of every currently scheduled timelock operation (persistent, capped
+    /// at `timelock::MAX_PENDING_OPERATIONS`). Stored in persistent storage so
+    /// that reading it does not inflate the instance footprint on every
+    /// unrelated contract invocation.
     TimelockOps,
     // Token Bridge storage keys:
-    /// Address authorized as the cross-chain token bridge relayer.
+    /// Sole authorized relayer address for bridge refunds (legacy single-relayer).
     BridgeRelayer,
+    /// Authorized relayer set (pubkeys) and threshold for a given source chain.
+    BridgeRelayerSet(u32),
     /// Status (enabled/disabled) of a supported target/source chain ID.
     BridgeChainStatus(u32),
     /// Current outbound bridge request sequence counter.
@@ -258,6 +299,8 @@ pub enum DataKey {
     AdminProposalVote(u64, Address),
     /// Tracks the contract version number, incremented on each `upgrade`.
     ContractVersion,
+    /// Schema version of the contract data layout.
+    SchemaVersion,
     // Staking storage keys:
     /// Individual stake record keyed by user (persistent).
     Stake(Address),
@@ -313,4 +356,32 @@ pub struct StakeRecord {
     pub staked_at: u64,
     /// Ledger timestamp when `unstake` was called, or 0 if not unstaking.
     pub unstaking_at: u64,
+}
+
+/// A report on the consistency of a user's storage state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvariantReport {
+    pub wrap_count_match_user_periods: bool,
+    pub wrap_count_match_wrap_periods: bool,
+    pub latest_period_matches_max: bool,
+    pub all_user_periods_live: bool,
+    pub balance_matches_wrap_count: bool,
+    pub wrap_count: u32,
+    pub user_periods_len: u32,
+    pub wrap_periods_len: u32,
+    pub latest_period: Option<u64>,
+    pub max_user_period: Option<u64>,
+    pub live_wraps_found: u32,
+    pub balance: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WrapSummary {
+    pub total_wraps: u32,
+    pub periods: Vec<u64>,
+    pub archetypes: Vec<Symbol>,
+    pub first_period: u64,
+    pub latest_period: u64,
 }

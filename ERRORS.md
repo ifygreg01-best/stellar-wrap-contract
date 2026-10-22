@@ -20,12 +20,50 @@ The codes are defined by the Rust `ContractError` enum in `src/lib.rs`.
 | 4 | `WrapAlreadyExists` | A wrap record already exists for the `(user, period)` pair | Retrying the same mint, or attempting to mint twice for same user+period | 1) Check whether `get_wrap(user, period)` already returns a record. 2) If your UI retries, make the client idempotent. 3) If you intended a new wrap, use a new `period`. |
 | 5 | `InvalidSignature` | Ed25519 signature verification failed against the contract's admin public key | - Wrong signature for the payload
 - Wrong `contract_id` / payload fields
-- Signature generated for a different user/period/archetype/data_hash | 1) Regenerate the signature using the correct canonical payload (see "Payload & signing notes" below).
+- Signature generated for a different user/period/archetype/data_hash
+- **v1 payload submitted** — `CURRENT_PAYLOAD_VERSION` was bumped to 2 and old payloads are now rejected unconditionally | 1) Regenerate the signature using the correct canonical v2 payload (see `docs/signing-payload.md`), including the new `valid_until` field and `payload_version = 2`.
 2) Confirm the signature corresponds to the correct contract instance (`contract_id` / `current_contract_address()`).
-3) Confirm you sign for the correct `user`, `period`, `archetype`, and `data_hash`.
-4) Ensure you pass the 64-byte signature bytes (not base64/hex-decoded to the wrong length). |
+3) Confirm you sign for the correct `user`, `period`, `archetype`, `data_hash`, and `valid_until`.
+4) Ensure you pass the 64-byte signature bytes (not base64/hex-decoded to the wrong length).
+5) If you recently upgraded the contract, verify your backend migrated from payload v1 to v2. |
 | 6 | `InvalidPeriod` | The period value is malformed or out of range | Period does not follow `YYYYMM` format (year 2024–2100, month 01–12) | Ensure `period` uses a valid year (2024–2100) and month (01–12). |
 | 7 | `WrapNotFound` | A wrap record was not found for the `(user, period)` pair | Revoking a wrap that never existed, or period mismatch | 1) Use `get_wrap(user, period)` to confirm existence. 2) Ensure you are passing the exact same `period` value used when the wrap was minted. 3) If the record may have been revoked, mint again or fetch the correct period. |
+| 57 | `SignatureExpired` | The mint signature's `valid_until` ledger timestamp has been exceeded (signature is no longer valid) | - The user submitted a mint transaction too slowly and the short-lived bearer signature expired
+- A cached or leaked signature from a backend log/support ticket was replayed well after its intended lifetime
+- `valid_until` was set too aggressively (e.g. 10 seconds, slower than the actual submit-to-ledger latency) | 1) Request a **fresh signature** from the backend signing service. The backend should issue signatures with `valid_until = now + T` where `T` covers the expected submit-to-ledger window plus some buffer (e.g. 15–30 minutes, not days).
+2) If you are building a UI, surface this error as "Your link has expired. Please request a new one." rather than a generic crypto failure.
+3) If you are the signing service, check that your clock is roughly in sync with the Stellar ledger (the contract compares `valid_until` against `e.ledger().timestamp()`, not wall-clock time on the signer).
+4) For one-off manual ops, `u64::MAX` is a legal "never expires" value — avoid it for automated paths, but it is acceptable for backfills. |
+
+---
+
+## Variant → producing code path → failing-path test
+
+Every variant in `ContractError` must be reachable from a code path and asserted by at least one failing-path test. This table is the source of truth for that mapping; keep it in sync when adding or removing variants.
+
+| Code | Variant | Producing code path | Failing-path test |
+|---:|---|---|---|
+| 1 | `AlreadyInitialized` | `initialize()` guard when `DataKey::Admin` is already set | `test_initialize_twice_fails` (asserts `Error(Contract, #1)`) |
+| 2 | `NotInitialized` | `require_initialized()` / admin lookup when `DataKey::Admin` is unset | `test_mint_before_initialize_fails` (asserts `Error(Contract, #2)`) |
+| 3 | `Unauthorized` | `require_admin()` on admin-only entrypoints; `user.require_auth()` in `mint_wrap`; reentrancy guard | `test_non_admin_update_wrap_fails`, `test_mint_wrong_auth_fails` (assert `Error(Contract, #3)`) |
+| 4 | `WrapAlreadyExists` | `mint_wrap` duplicate `(user, period)` check | `test_mint_duplicate_period_fails` (asserts `Error(Contract, #4)`) |
+| 5 | `InvalidSignature` | `verify_ed25519` failure in `mint_wrap` | `test_mint_bad_signature_fails` (asserts `Error(Contract, #5)`) |
+| 6 | `InvalidPeriod` | `validate_period()` range/format check | `test_mint_invalid_period_fails` (asserts `Error(Contract, #6)`) |
+| 7 | `WrapNotFound` | `revoke_wrap` / `get_wrap` lookup miss | `test_revoke_missing_wrap_fails` (asserts `Error(Contract, #7)`) |
+
+If a variant has no producing code path, it is dead surface and must be removed from `ContractError` (and from this table). If a variant is reachable but has no failing-path test, add one before merging.
+
+---
+
+## CI guard: new variants must ship with a test
+
+To keep the mapping above from rotting, CI runs a check that fails when a variant is added to `ContractError` without a corresponding failing-path test. The check:
+
+1. Parses the `ContractError` enum in `src/lib.rs` and collects every variant name.
+2. Scans the test suite for each variant name (e.g. `ContractError::InvalidPeriod` or `Error(Contract, #6)`).
+3. Fails the build if any variant is not referenced by at least one test.
+
+When you add a variant, add its producing code path, a failing-path test that asserts it, and a row in the table above in the same PR.
 
 ---
 
@@ -99,6 +137,20 @@ Some failures can look like “unexpected panics” depending on the tooling:
 
 ---
 
+## Unstake / withdraw timing (unbonding period)
+
+`unstake` and `withdraw_stake` are separate entry points with an unbonding delay between them. The following interleavings have defined, documented outcomes:
+
+- **Stake again after `unstake`, before `withdraw_stake`:** the pending withdrawal is **not** reset, cancelled, or corrupted. The unbonding record (amount + unlock ledger) is preserved, and the new stake is tracked independently. `withdraw_stake` still releases only the originally unstaked amount once the delay elapses.
+- **`withdraw_stake` before the delay elapses:** fails cleanly (the unlock ledger has not been reached); no funds are released.
+- **`withdraw_stake` twice:** the second call fails cleanly because the pending withdrawal record is cleared on the first successful withdrawal; no double release.
+- **`unstake` with no active stake:** fails cleanly rather than writing a zero record; no empty/zero withdrawal is persisted.
+- **Withdrawing exactly at the boundary ledger:** succeeds — the delay is satisfied when the current ledger equals the unlock ledger.
+
+Each of these interleavings is covered by a test.
+
+---
+
 ## Troubleshooting tips (fast)
 
 - If you see **`Error(Contract, #3)`**, check that:
@@ -123,3 +175,30 @@ These error codes are defined in `src/lib.rs` under:
 
 Same license as the rest of this repository.
 
+## Error 57 — `StaleProposal`
+
+**Variant**: `ContractError::StaleProposal`
+**Code**: `57`
+**Introduced**: Issue #864 — Governance proposal staleness fix.
+
+### What it means
+
+`execute_admin_proposal` detected that the contract admin has changed since the
+proposal was created. The proposal's `admin_at_creation` field no longer matches
+`DataKey::Admin`, which means executing the proposal would silently revert the
+contract to a superseded admin state.
+
+### Common causes
+
+1. **Direct admin rotation**: `update_admin` was called between proposal creation
+   and execution.
+2. **Timelocked `SetAdmin`**: A `timelock_execute` for a `SetAdmin` action
+   completed while the proposal was open.
+3. **Concurrent proposal race**: A different governance proposal executed first,
+   changing the admin, leaving this proposal stale.
+
+### Resolution
+
+The stale proposal cannot be executed. To change the admin, create a new
+proposal under the current admin. The old stale proposal may be cancelled via
+`cancel_admin_proposal` to clean up storage.
